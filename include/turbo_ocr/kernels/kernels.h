@@ -103,6 +103,40 @@ int cuda_gpu_ccl_detect(
     int *d_num_boxes,            // [1] scratch
     GpuDetBox *h_boxes,          // host output (pinned)
     int *h_num_boxes,            // host output count
-    cudaStream_t stream);
+    cudaStream_t stream,
+    int *h_num_total = nullptr); // optional: pre-filter component total
+
+// JFA per-component Euclidean unclip (all-GPU, no merges, no pred_map
+// download): matches Clipper's polygon-offset distance area*ratio/perimeter
+// per component while preserving Voronoi boundaries between adjacent text.
+//   d_compact_ids       = CCL compact label map (int32_t, -1=bg, 0..N-1)
+//   d_expand_per_comp   = float[kMaxGpuComponents], per-component expand (px)
+//   d_expanded_labels   = uint32_t output (1..N, 0=bg)
+void cuda_jfa_expand_labels(const uint8_t *d_bitmap,
+                            const int32_t *d_compact_ids,
+                            const float *d_expand_per_comp,
+                            uint32_t *d_expanded_labels,
+                            int w, int h,
+                            int2 *d_seeds, int2 *d_seeds_alt,
+                            cudaStream_t stream);
+
+// Compute per-component expand distance from PRE-filter CCL bboxes.
+// Indexed by PRE-filter compact_id (matches what compact_ids[] stores) so JFA
+// expand can look up expand_per_comp[compact_ids[seed]] directly. Empty /
+// size-rejected / score-rejected slots get expand=0 → JFA treats as bg.
+void cuda_compute_expand_per_comp(
+    const GpuDetBox *d_bboxes, int num_slots,
+    float unclip_ratio, float min_expand, float max_expand,
+    float box_thresh, float *d_expand_per_comp, cudaStream_t stream);
+
+// Bbox extraction + score over expanded region. One block per pre-filter
+// compact_id. Empty / filtered-out slots (expand_per_comp[cid]<=0) early-exit
+// without scanning. Output bboxes[cid].pixel_count is 0 for those slots.
+void cuda_jfa_extract_bboxes(const uint32_t *d_expanded_labels,
+                             const float *d_pred_map,
+                             const float *d_expand_per_comp,
+                             int w, int h,
+                             GpuDetBox *d_bboxes, int num_slots,
+                             cudaStream_t stream);
 
 } // namespace turbo_ocr::kernels

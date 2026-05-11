@@ -47,6 +47,8 @@ private:
   // GPU CCL mode: 0=CPU contours, 1=GPU CCL+per-ROI findContours (default, same accuracy + faster),
   // 2=GPU CCL fast (experimental, speed-only — poor accuracy F1~53%, not recommended for production)
   int gpu_ccl_mode_ = 1;
+  float box_thresh_ = kDetDbBoxThresh;
+  float unclip_scale_ = 1.0f;
 
   std::unique_ptr<engine::TrtEngine> engine_;
 
@@ -106,6 +108,14 @@ private:
   std::vector<std::vector<cv::Point>> ccl_roi_contours_buf_;
   std::vector<cv::Point> ccl_contour_buf_;
 
+  // JFA buffers for per-component Euclidean unclip on GPU (RAII).
+  // Used by run_gpu_ccl_fast (GPU_CCL=2): all-GPU post-processing path that
+  // matches CPU CCL=1 accuracy without downloading the prediction map.
+  CudaPtr<uint32_t> d_jfa_labels_;     // [max_pixels] expanded label map
+  CudaPtr<int2> d_jfa_seeds_;          // [max_pixels] JFA nearest-seed coords (primary)
+  CudaPtr<int2> d_jfa_seeds_alt_;      // [max_pixels] JFA ping-pong buffer
+  CudaPtr<float> d_expand_per_comp_;   // [kMaxGpuComponents] per-component expand
+
   // Common buffer allocation (called by both load_model overloads)
   [[nodiscard]] bool init_buffers();
 
@@ -114,8 +124,9 @@ private:
                                               int orig_h, int orig_w,
                                               cudaStream_t stream);
 
-  // GPU CCL fast (EXPERIMENTAL, GPU_CCL=2): direct bbox expansion, NO CPU contour processing.
-  // Warning: poor accuracy (F1~53%). Use only for speed benchmarks, not production.
+  // GPU CCL fast (GPU_CCL=2): all-GPU JFA per-component Euclidean unclip.
+  // Matches CPU CCL=1 word-F1 within run-to-run noise (~0.900 vs 0.902 on
+  // FUNSD), with tighter latency tail (no pred_map download, no findContours).
   [[nodiscard]] std::vector<Box> run_gpu_ccl_fast(int resize_h, int resize_w,
                                                     int orig_h, int orig_w,
                                                     cudaStream_t stream);

@@ -103,7 +103,13 @@ public:
       return {};
     }
 
-    // nvjpegDecode with CPU output is synchronous, no stream sync needed
+    // HARDWARE/GPU_HYBRID is async; must sync before returning so the cv::Mat
+    // is materialized and safe to hand to other threads. Without this the
+    // CUDA context faults with cudaErrorIllegalAddress once the Mat is freed.
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return {};
+    }
     return result;
   }
 

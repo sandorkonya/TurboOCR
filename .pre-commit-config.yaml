@@ -1,0 +1,11 @@
+repos:
+  - repo: local
+    hooks:
+      - id: endpoint-matrix-fast
+        name: endpoint x filetype matrix (fast)
+        entry: bash tests/regression/run_matrix.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+        env:
+          MATRIX_FAST: "1"

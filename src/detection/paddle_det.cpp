@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <ranges>
+#include <unordered_map>
 
 #include <opencv2/imgproc.hpp>
 
@@ -64,9 +65,14 @@ bool PaddleDet::init_buffers() {
   engine_->bind_io(d_input_.get(), d_output_.get());
 
   // GPU CCL mode: 0=CPU contours, 1=GPU CCL+per-ROI findContours (default),
-  // 2=GPU CCL fast (experimental, speed-only — poor accuracy F1~53%)
+  // 2=all-GPU JFA per-component Euclidean unclip
   if (const char *env = std::getenv("GPU_CCL"))
     gpu_ccl_mode_ = std::atoi(env);
+  // box_thresh_ + unclip_scale_ apply to all three modes (0/1/2).
+  if (const char *env = std::getenv("GPU_BOX_THRESH"))
+    box_thresh_ = (float)std::atof(env);
+  if (const char *env = std::getenv("GPU_UNCLIP_SCALE"))
+    unclip_scale_ = (float)std::atof(env);
 
   if (gpu_ccl_mode_ > 0) {
     // Pre-allocate ALL GPU CCL buffers (no per-request alloc)
@@ -81,6 +87,12 @@ bool PaddleDet::init_buffers() {
     // Pinned host memory for result transfer
     h_ccl_boxes_ = CudaHostPtr<turbo_ocr::kernels::GpuDetBox>(
         turbo_ocr::kernels::kMaxGpuComponents);
+
+    // JFA (Jump Flooding) per-component label expansion
+    d_jfa_labels_ = CudaPtr<uint32_t>(max_pixels);
+    d_jfa_seeds_ = CudaPtr<int2>(max_pixels);
+    d_jfa_seeds_alt_ = CudaPtr<int2>(max_pixels);
+    d_expand_per_comp_ = CudaPtr<float>(turbo_ocr::kernels::kMaxGpuComponents);
   }
 
   return true;
@@ -98,7 +110,7 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
   int h_num_boxes = 0;
   turbo_ocr::kernels::cuda_gpu_ccl_detect(
       cur_bitmap_, cur_output_, resize_w, resize_h,
-      kDetDbBoxThresh,
+      box_thresh_,
       d_ccl_labels_.get(), d_ccl_compact_ids_.get(), d_ccl_id_counter_.get(),
       d_ccl_bboxes_.get(), d_ccl_num_boxes_.get(),
       h_ccl_boxes_.get(), &h_num_boxes, stream);
@@ -163,7 +175,7 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
     for (const auto &pt : best_contour)
       ccl_contour_buf_.push_back(cv::Point(pt.x + roi_x, pt.y + roi_y));
 
-    // Use GPU CCL score (already filtered by kDetDbBoxThresh in the GPU kernel)
+    // Use GPU CCL score (already filtered by box_thresh_ in the GPU kernel)
     // Skip box_score_fast — saves downloading pred_map (2.4MB) entirely
 
     float ssid = 0;
@@ -171,7 +183,7 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
     if (ssid < kMinBoxSide)
       continue;
 
-    auto unclipped = unclip(ccl_contour_buf_, kDetDbUnclipRatio);
+    auto unclipped = unclip(ccl_contour_buf_, kDetDbUnclipRatio * unclip_scale_);
     if (unclipped.size() < 3)
       continue;
 
@@ -200,10 +212,13 @@ PaddleDet::run_gpu_ccl(int resize_h, int resize_w,
   return boxes;
 }
 
-// GPU CCL fast path (EXPERIMENTAL, GPU_CCL=2): direct bbox expansion, NO CPU contour processing.
-// Computes unclip expansion analytically from bbox dimensions.
-// No bitmap download, no findContours, no Clipper — pure arithmetic.
-// WARNING: poor accuracy (F1~53%). Use only for speed benchmarks, not production.
+// GPU CCL + JFA per-component Euclidean unclip (all-GPU).
+// 1. CCL on original → compact_ids + bboxes + moments
+// 2. JFA propagates nearest-foreground coords (unsigned SDF)
+// 3. Expand: pixels within `expand` distance assigned to nearest component
+//    via compact_ids lookup → no component merging (Voronoi boundary)
+// 4. GPU bbox extraction: one block per component scans expanded labels
+// 5. Copy expanded bboxes → scale → filter → output
 std::vector<Box>
 PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
                               int orig_h, int orig_w,
@@ -211,65 +226,72 @@ PaddleDet::run_gpu_ccl_fast(int resize_h, int resize_w,
   float ratio_h = static_cast<float>(resize_h) / orig_h;
   float ratio_w = static_cast<float>(resize_w) / orig_w;
 
+  // Step 1: CCL on original mask → compact IDs + original bboxes
   int h_num_boxes = 0;
+  int h_num_total = 0;
   turbo_ocr::kernels::cuda_gpu_ccl_detect(
       cur_bitmap_, cur_output_, resize_w, resize_h,
-      kDetDbBoxThresh,
+      box_thresh_,
       d_ccl_labels_.get(), d_ccl_compact_ids_.get(), d_ccl_id_counter_.get(),
       d_ccl_bboxes_.get(), d_ccl_num_boxes_.get(),
-      h_ccl_boxes_.get(), &h_num_boxes, stream);
+      h_ccl_boxes_.get(), &h_num_boxes, stream, &h_num_total);
 
   std::vector<Box> boxes;
-  if (h_num_boxes == 0)
-    return boxes;
+  if (h_num_boxes == 0) return boxes;
 
+  // Process all PRE-filter compact_ids — that's what compact_ids[] stores.
+  // Score+size filter is applied inside compute_expand_per_comp_kernel.
+  using turbo_ocr::kernels::GpuDetBox;
+  using turbo_ocr::kernels::kMaxGpuComponents;
+  int num_slots = std::min(h_num_total, (int)kMaxGpuComponents);
+  if (num_slots == 0) return boxes;
+
+  // Step 2: Per-component expand distance from CCL bboxes (Clipper-equivalent
+  // area*ratio/perim). Indexed by PRE-filter compact_id.
+  turbo_ocr::kernels::cuda_compute_expand_per_comp(
+      d_ccl_bboxes_.get(), num_slots,
+      kDetDbUnclipRatio * unclip_scale_, /*min*/ 2.0f, /*max*/ 24.0f,
+      box_thresh_, d_expand_per_comp_.get(), stream);
+
+  // Step 3: JFA + per-component label expansion (variable cutoff per component)
+  turbo_ocr::kernels::cuda_jfa_expand_labels(
+      cur_bitmap_, d_ccl_compact_ids_.get(), d_expand_per_comp_.get(),
+      d_jfa_labels_.get(), resize_w, resize_h,
+      d_jfa_seeds_.get(), d_jfa_seeds_alt_.get(), stream);
+
+  // Step 4: GPU bbox extraction over expanded region. Launcher inits sentinels
+  // for atomic scatter, so no pre-memset needed.
+  GpuDetBox *exp_bboxes = d_ccl_bboxes_.get() + kMaxGpuComponents;
+  turbo_ocr::kernels::cuda_jfa_extract_bboxes(
+      d_jfa_labels_.get(), cur_output_, d_expand_per_comp_.get(),
+      resize_w, resize_h, exp_bboxes, num_slots, stream);
+
+  // Step 5: Copy expanded bboxes to host
+  CudaHostPtr<GpuDetBox> h_exp_bboxes(num_slots);
+  CUDA_CHECK(cudaMemcpyAsync(h_exp_bboxes.get(), exp_bboxes,
+      num_slots * sizeof(GpuDetBox), cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+
+  // Filter, scale, output. pixel_count==0 means slot was empty or filtered out.
   boxes.reserve(h_num_boxes);
+  for (int i = 0; i < num_slots; i++) {
+    const auto &eb = h_exp_bboxes.get()[i];
+    if (eb.pixel_count < 9) continue;
+    int bw = eb.xmax - eb.xmin + 1, bh = eb.ymax - eb.ymin + 1;
+    if (bw < kMinUnclippedSide || bh < kMinUnclippedSide) continue;
 
-  for (int i = 0; i < h_num_boxes; i++) {
-    const auto &gb = h_ccl_boxes_.get()[i];
-
-    int bw = gb.xmax - gb.xmin + 1;
-    int bh = gb.ymax - gb.ymin + 1;
-    if (bw < 3 || bh < 3)
-      continue;
-
-    // Analytical unclip: expand bbox by distance = area * unclip_ratio / perimeter
-    // For axis-aligned box: area = bw*bh, perimeter = 2*(bw+bh)
-    float area = static_cast<float>(bw * bh);
-    float perimeter = 2.0f * (bw + bh);
-    float expand = area * kDetDbUnclipRatio / perimeter;
-
-    // Expand and clamp to image bounds
-    int x0 = std::max(0, static_cast<int>(std::round(gb.xmin - expand)));
-    int y0 = std::max(0, static_cast<int>(std::round(gb.ymin - expand)));
-    int x1 = std::min(resize_w - 1, static_cast<int>(std::round(gb.xmax + expand)));
-    int y1 = std::min(resize_h - 1, static_cast<int>(std::round(gb.ymax + expand)));
-
-    int ew = x1 - x0 + 1;
-    int eh = y1 - y0 + 1;
-    if (ew < kMinUnclippedSide || eh < kMinUnclippedSide)
-      continue;
-
-    // Scale to original image coordinates
     Box box;
-    box[0] = {std::clamp(static_cast<int>(std::round(x0 / ratio_w)), 0, orig_w - 1),
-              std::clamp(static_cast<int>(std::round(y0 / ratio_h)), 0, orig_h - 1)};
-    box[1] = {std::clamp(static_cast<int>(std::round(x1 / ratio_w)), 0, orig_w - 1),
-              std::clamp(static_cast<int>(std::round(y0 / ratio_h)), 0, orig_h - 1)};
-    box[2] = {std::clamp(static_cast<int>(std::round(x1 / ratio_w)), 0, orig_w - 1),
-              std::clamp(static_cast<int>(std::round(y1 / ratio_h)), 0, orig_h - 1)};
-    box[3] = {std::clamp(static_cast<int>(std::round(x0 / ratio_w)), 0, orig_w - 1),
-              std::clamp(static_cast<int>(std::round(y1 / ratio_h)), 0, orig_h - 1)};
-
-    // Filter tiny boxes
-    int rw = box[1][0] - box[0][0];
-    int rh = box[3][1] - box[0][1];
-    if (rw <= 3 || rh <= 3)
-      continue;
-
+    box[0] = {std::clamp(static_cast<int>(std::round(eb.xmin / ratio_w)), 0, orig_w - 1),
+              std::clamp(static_cast<int>(std::round(eb.ymin / ratio_h)), 0, orig_h - 1)};
+    box[1] = {std::clamp(static_cast<int>(std::round(eb.xmax / ratio_w)), 0, orig_w - 1),
+              std::clamp(static_cast<int>(std::round(eb.ymin / ratio_h)), 0, orig_h - 1)};
+    box[2] = {std::clamp(static_cast<int>(std::round(eb.xmax / ratio_w)), 0, orig_w - 1),
+              std::clamp(static_cast<int>(std::round(eb.ymax / ratio_h)), 0, orig_h - 1)};
+    box[3] = {std::clamp(static_cast<int>(std::round(eb.xmin / ratio_w)), 0, orig_w - 1),
+              std::clamp(static_cast<int>(std::round(eb.ymax / ratio_h)), 0, orig_h - 1)};
+    if (std::abs(box[1][0]-box[0][0]) <= 3 || std::abs(box[3][1]-box[0][1]) <= 3) continue;
     boxes.push_back(box);
   }
-
   return boxes;
 }
 
@@ -292,7 +314,8 @@ PaddleDet::run_cpu_contours(int resize_h, int resize_w,
 
   return extract_boxes_from_bitmap(
       pred_map, bitmap, orig_h, orig_w, resize_h, resize_w,
-      kDetDbBoxThresh, kDetDbUnclipRatio, kMinBoxSide, kMinUnclippedSide,
+      box_thresh_, kDetDbUnclipRatio * unclip_scale_,
+      kMinBoxSide, kMinUnclippedSide,
       shifted_buf_, mask_buf_, contours_buf_, hierarchy_buf_);
 }
 

@@ -263,6 +263,7 @@ else()
         src/layout/paddle_layout.cpp
         src/pipeline/ocr_pipeline.cpp
         src/kernels/kernels.cu
+        src/kernels/jfa.cu
         src/render/pdf_renderer.cpp
         src/pdf/pdf_text_layer.cpp
     )
@@ -339,6 +340,31 @@ else()
         ${GRPC_LIBRARIES}
         protobuf::libprotobuf
     )
+
+    # diff_ccl: side-by-side comparator for CPU CCL=1 vs GPU CCL=2 outputs.
+    # Loads an image, runs both detection paths, prints box counts, IoU stats,
+    # and missed/extra boxes. Used to drive the GPU JFA pipeline accuracy.
+    add_executable(diff_ccl tools/diff_ccl.cpp)
+    target_include_directories(diff_ccl PRIVATE include)
+    target_link_libraries(diff_ccl PRIVATE
+        turbo_ocr_gpu
+        ${OpenCV_LIBS}
+    )
+    set_target_properties(diff_ccl PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+
+    # Regression: nvJPEG handler-thread -> dispatcher-worker race
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_nvjpeg_race.cpp)
+        add_executable(test_nvjpeg_race tools/test_nvjpeg_race.cpp)
+        target_include_directories(test_nvjpeg_race PRIVATE include)
+        target_link_libraries(test_nvjpeg_race PRIVATE
+            CUDA::cudart
+            CUDA::nvjpeg
+            ${OpenCV_LIBS}
+        )
+    endif()
 endif()
 
 # --- Interprocedural / link-time optimization (Release only) --------------

@@ -94,26 +94,64 @@ grpc_pre_decode_dim_check(grpc::ServerContext *ctx,
   return std::nullopt;
 }
 
+// Pure-CPU decoder for the non-JPEG branch of the gRPC handlers. JPEGs are
+// routed via grpc_jpeg_decode_and_infer (decode happens on a dispatcher
+// worker thread); reaching this with JPEG bytes would be a caller bug.
 inline cv::Mat grpc_decode_image(std::string_view image_data) {
   auto *data = reinterpret_cast<const unsigned char *>(image_data.data());
   auto len = image_data.size();
-  if (len >= 2 && data[0] == 0xFF && data[1] == 0xD8) {
-#ifndef USE_CPU_ONLY
-    thread_local decode::NvJpegDecoder tl_nvjpeg;
-    if (tl_nvjpeg.available()) {
-      cv::Mat img = tl_nvjpeg.decode(data, len);
-      if (!img.empty()) return img;
-    }
-#endif
-    if (len > static_cast<size_t>(INT_MAX)) return {};
-    return cv::imdecode(cv::Mat(1, static_cast<int>(len), CV_8UC1,
-                                const_cast<unsigned char *>(data)),
-                        cv::IMREAD_COLOR);
-  }
   if (decode::FastPngDecoder::is_png(data, len))
     return decode::FastPngDecoder::decode(data, len);
-  return {};
+  if (len > static_cast<size_t>(INT_MAX)) return {};
+  return cv::imdecode(cv::Mat(1, static_cast<int>(len), CV_8UC1,
+                              const_cast<unsigned char *>(data)),
+                      cv::IMREAD_COLOR);
 }
+
+#ifndef USE_CPU_ONLY
+// Decode + infer on a dispatcher worker thread so nvJPEG's async NVDEC work
+// runs on the pipeline's own stream — matches /ocr/raw and avoids the
+// cross-thread DMA race that poisoned the CUDA context.
+inline std::future<pipeline::OcrPipelineResult>
+grpc_jpeg_decode_and_infer(pipeline::PipelineDispatcher &dispatcher,
+                           std::string_view image_bytes,
+                           bool want_layout, bool want_reading_order) {
+  std::string owned(image_bytes);
+  return dispatcher.submit(
+      [owned = std::move(owned), want_layout, want_reading_order](
+          auto &e) -> pipeline::OcrPipelineResult {
+        const auto *d =
+            reinterpret_cast<const unsigned char *>(owned.data());
+        size_t n = owned.size();
+        auto &nvjpeg = e.get_nvjpeg();
+        if (nvjpeg.available()) {
+          auto [w, h] = nvjpeg.get_dimensions(d, n);
+          if (w > 0 && h > 0) {
+            auto [d_buf, pitch] = e.pipeline->ensure_gpu_buf(h, w);
+            if (nvjpeg.decode_to_gpu(d, n, d_buf, pitch, w, h, e.stream)) {
+              turbo_ocr::GpuImage gi{
+                  .data = d_buf, .step = pitch, .rows = h, .cols = w};
+              try {
+                return e.pipeline->run_with_layout(
+                    gi, e.stream, want_layout, want_reading_order);
+              } catch (const std::exception &) {}
+            }
+          }
+        }
+        cv::Mat img = nvjpeg.decode(d, n);
+        if (img.empty() && n <= static_cast<size_t>(INT_MAX)) {
+          img = cv::imdecode(
+              cv::Mat(1, static_cast<int>(n), CV_8UC1,
+                      const_cast<unsigned char *>(d)),
+              cv::IMREAD_COLOR);
+        }
+        if (img.empty())
+          throw turbo_ocr::ImageDecodeError("Failed to decode JPEG");
+        return e.pipeline->run_with_layout(img, e.stream, want_layout,
+                                           want_reading_order);
+      });
+}
+#endif
 
 class OCRServiceImpl final : public ocr::OCRService::Service {
 public:
@@ -240,6 +278,37 @@ public:
     if (auto err = grpc_pre_decode_dim_check(ctx, request->image()); err)
       return *err;
 
+#ifndef USE_CPU_ONLY
+    {
+      const auto *bytes =
+          reinterpret_cast<const unsigned char *>(request->image().data());
+      const size_t blen = request->image().size();
+      if (dispatcher_ &&
+          decode::NvJpegDecoder::is_jpeg(bytes, blen)) {
+        try {
+          auto out = grpc_jpeg_decode_and_infer(*dispatcher_, request->image(),
+                                                 want_layout,
+                                                 want_reading_order).get();
+          fill_response(response, out.results, out.layout, out.reading_order,
+                        want_blocks);
+          return grpc::Status::OK;
+        } catch (const turbo_ocr::ImageDecodeError &) {
+          return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
+                            "IMAGE_DECODE_FAILED", "Decode failed");
+        } catch (const turbo_ocr::PoolExhaustedError &e) {
+          return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
+                            "SERVER_BUSY", e.what());
+        } catch (const std::exception &e) {
+          std::cerr << std::format("[gRPC] JPEG infer error: {}\n", e.what());
+          return grpc_error(ctx, grpc::StatusCode::INTERNAL,
+                            "INFERENCE_ERROR", "Inference error");
+        }
+      }
+    }
+#endif
+
+    // Non-JPEG (PNG/etc.) path: CPU decode on this thread is safe, then
+    // hand the materialized cv::Mat to the dispatcher.
     cv::Mat img = grpc_decode_image(request->image());
     if (img.empty()) [[unlikely]]
       return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
@@ -300,10 +369,20 @@ public:
         return *err;
     }
 
-    // Decode all images first
+    // JPEGs decode inside the dispatcher lambda (see grpc_jpeg_decode_and_infer);
+    // PNG/other decode here on CPU and ship the materialized cv::Mat.
     std::vector<cv::Mat> imgs(n);
+    std::vector<bool> is_jpeg(n, false);
     for (int i = 0; i < n; ++i) {
-      imgs[i] = grpc_decode_image(request->images(i));
+      const auto &bytes = request->images(i);
+      const auto *p = reinterpret_cast<const unsigned char *>(bytes.data());
+#ifndef USE_CPU_ONLY
+      if (dispatcher_ && decode::NvJpegDecoder::is_jpeg(p, bytes.size())) {
+        is_jpeg[i] = true;
+        continue; // decode happens inside the dispatcher lambda
+      }
+#endif
+      imgs[i] = grpc_decode_image(bytes);
     }
 
     // Post-decode safety net for formats we didn't sniff (BMP/TIFF/WebP).
@@ -319,34 +398,73 @@ public:
       }
     }
 
-    // Check we have at least one valid image
+    // Check we have at least one valid candidate. JPEGs are still encoded
+    // bytes at this point — we trust the pre-decode dim sniff and decode
+    // failures will surface per-slot below.
     bool any_valid = false;
     for (int i = 0; i < n; ++i) {
-      if (!imgs[i].empty()) { any_valid = true; break; }
+      if (is_jpeg[i] || !imgs[i].empty()) { any_valid = true; break; }
     }
     if (!any_valid)
       return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
                         "IMAGE_DECODE_FAILED", "No valid images");
 
-    // Pre-allocate proto entries on the main thread so workers only
-    // mutate their own slot — protobuf's RepeatedPtrField is not
-    // thread-safe for concurrent add_*. Workers then fill entries[i]
-    // in parallel through run_infer, which is reentrant on both the
-    // GPU dispatcher (queue-serialized) and the CPU InferFunc (each
-    // call acquires its own pool handle).
+    // RepeatedPtrField is not thread-safe for concurrent add_*, so pre-allocate.
     response->set_total_images(n);
     std::vector<ocr::OCRResponse *> entries;
     entries.reserve(static_cast<size_t>(n));
     for (int i = 0; i < n; ++i) {
       auto *e = response->add_batch_results();
-      if (imgs[i].empty()) e->set_num_detections(0);
+      if (!is_jpeg[i] && imgs[i].empty()) e->set_num_detections(0);
       entries.push_back(e);
     }
 
+#ifndef USE_CPU_ONLY
+    if (dispatcher_) {
+      std::vector<std::future<pipeline::OcrPipelineResult>> futs(n);
+      for (int i = 0; i < n; ++i) {
+        try {
+          if (is_jpeg[i]) {
+            futs[i] = grpc_jpeg_decode_and_infer(
+                *dispatcher_, request->images(i), want_layout,
+                want_reading_order);
+          } else if (!imgs[i].empty()) {
+            cv::Mat img_owned = std::move(imgs[i]);
+            futs[i] = dispatcher_->submit(
+                [img_owned = std::move(img_owned), want_layout,
+                 want_reading_order](auto &e) {
+                  return e.pipeline->run_with_layout(
+                      img_owned, e.stream, want_layout, want_reading_order);
+                });
+          }
+        } catch (const turbo_ocr::PoolExhaustedError &e) {
+          return grpc_error(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED,
+                            "SERVER_BUSY", e.what());
+        }
+      }
+      for (int i = 0; i < n; ++i) {
+        if (!futs[i].valid()) continue;
+        try {
+          auto out = futs[i].get();
+          fill_response(entries[i], out.results, out.layout,
+                        out.reading_order, want_blocks);
+        } catch (const std::exception &e) {
+          std::cerr << std::format("[gRPC Batch] Image {} error: {}\n",
+                                   i, e.what());
+          entries[i]->set_num_detections(0);
+        } catch (...) {
+          entries[i]->set_num_detections(0);
+        }
+      }
+      return grpc::Status::OK;
+    }
+#endif
+
+    // CPU-only fanout: bounded jthread pool, each thread calls run_infer
+    // (which is synchronous through the InferFunc on this build).
     static const int requested_workers = env_int("GRPC_BATCH_WORKERS", 8, 1, 256);
     const int num_workers = std::min(n, requested_workers);
     std::atomic<int> next_idx{0};
-
     {
       std::vector<std::jthread> workers;
       workers.reserve(static_cast<size_t>(num_workers));
@@ -365,14 +483,12 @@ public:
                                        i, e.what());
               entries[i]->set_num_detections(0);
             } catch (...) {
-              std::cerr << std::format("[gRPC Batch] Image {} error: unknown\n", i);
               entries[i]->set_num_detections(0);
             }
           }
         });
       }
-    } // jthreads auto-join
-
+    }
     return grpc::Status::OK;
   }
 

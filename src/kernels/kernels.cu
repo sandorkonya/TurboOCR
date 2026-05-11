@@ -11,6 +11,31 @@ namespace cg = cooperative_groups;
 
 namespace turbo_ocr::kernels {
 
+// Cache occupancy + SM count per (device, kernel, block_size). Uses
+// cudaGetDevice() so multi-GPU hosts don't get sized for device 0.
+template <typename Fn>
+static int coop_grid_for(Fn kernel, int threads) {
+  int dev = 0;
+  cudaGetDevice(&dev);
+  static thread_local int cached_dev = -1;
+  static thread_local int cached_sms = 0;
+  static thread_local const void *cached_fn = nullptr;
+  static thread_local int cached_threads = 0;
+  static thread_local int cached_per_sm = 0;
+  if (dev != cached_dev) {
+    cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, dev);
+    cached_dev = dev;
+    cached_fn = nullptr;
+  }
+  if (cached_fn != (const void *)kernel || cached_threads != threads) {
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &cached_per_sm, kernel, threads, 0);
+    cached_fn = (const void *)kernel;
+    cached_threads = threads;
+  }
+  return cached_per_sm * cached_sms;
+}
+
 // --- Fused Resize + Normalize + CHW for Detection ---
 
 __global__ __launch_bounds__(256)
@@ -845,7 +870,8 @@ int cuda_gpu_ccl_detect(
     int *d_num_boxes,
     GpuDetBox *h_boxes,
     int *h_num_boxes,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    int *h_num_total) {
 
   int total = w * h;
   int threads = 256;
@@ -882,13 +908,7 @@ int cuda_gpu_ccl_detect(
   // use a stride loop in the kernel to cover all pixels.
   CUDA_CHECK(cudaMemsetAsync(d_id_counter, 0, sizeof(int), stream));
   {
-    int coop_blocks_per_sm = 0;
-    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &coop_blocks_per_sm, ccl_fused_compact_ids_kernel, threads, 0));
-    int num_sms = 0;
-    CUDA_CHECK(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0));
-    int coop_grid = coop_blocks_per_sm * num_sms;
-    // Don't launch more blocks than needed
+    int coop_grid = coop_grid_for(ccl_fused_compact_ids_kernel, threads);
     if (coop_grid > blocks) coop_grid = blocks;
 
     int max_comp = kMaxGpuComponents;
@@ -925,11 +945,14 @@ int cuda_gpu_ccl_detect(
   }
 
   // === SINGLE SYNC: copy count + boxes in one batch, one sync ===
-  // Copy count first, then max possible boxes. One sync for both.
   CUDA_CHECK(cudaMemcpyAsync(h_num_boxes, d_num_boxes, sizeof(int),
                               cudaMemcpyDeviceToHost, stream));
-  // Speculatively copy up to kMaxGpuComponents boxes (small: 48KB max).
-  // After sync we'll use only h_count of them.
+  // Optional: pre-filter component total for callers that index by pre-filter
+  // compact_id (e.g. the JFA per-component expand path).
+  if (h_num_total != nullptr) {
+    CUDA_CHECK(cudaMemcpyAsync(h_num_total, d_id_counter, sizeof(int),
+                                cudaMemcpyDeviceToHost, stream));
+  }
   CUDA_CHECK(cudaMemcpyAsync(h_boxes, d_out_bboxes,
                               kMaxGpuComponents * sizeof(GpuDetBox),
                               cudaMemcpyDeviceToHost, stream));

@@ -10,13 +10,18 @@
 #include "turbo_ocr/pipeline/pipeline_pool.h"
 #include "turbo_ocr/common/cuda_check.h"
 #include "turbo_ocr/common/errors.h"
+#include "turbo_ocr/decode/nvjpeg_decoder.h"
 
 namespace turbo_ocr::pipeline {
 
-/// OcrPipeline + its dedicated CUDA stream, managed as a single poolable unit.
+/// OcrPipeline + its dedicated CUDA stream + its own nvJPEG decoder, managed
+/// as a single poolable unit. One per dispatcher worker thread.
 struct GpuPipelineEntry {
   std::unique_ptr<OcrPipeline> pipeline;
   cudaStream_t stream = nullptr;
+  // Lazily constructed on the worker thread so the nvJPEG handle binds to
+  // the same primary context that owns `stream` and `pipeline`.
+  std::unique_ptr<decode::NvJpegDecoder> nvjpeg;
 
   GpuPipelineEntry() = default;
 
@@ -24,20 +29,28 @@ struct GpuPipelineEntry {
       : pipeline(std::move(p)), stream(s) {}
 
   ~GpuPipelineEntry() noexcept {
+    nvjpeg.reset();
     if (stream)
       cudaStreamDestroy(stream);
   }
 
-  // Move-only
+  decode::NvJpegDecoder &get_nvjpeg() {
+    if (!nvjpeg) nvjpeg = std::make_unique<decode::NvJpegDecoder>();
+    return *nvjpeg;
+  }
+
   GpuPipelineEntry(GpuPipelineEntry &&o) noexcept
-      : pipeline(std::move(o.pipeline)), stream(o.stream) {
+      : pipeline(std::move(o.pipeline)), stream(o.stream),
+        nvjpeg(std::move(o.nvjpeg)) {
     o.stream = nullptr;
   }
   GpuPipelineEntry &operator=(GpuPipelineEntry &&o) noexcept {
     if (this != &o) {
+      nvjpeg.reset();
       if (stream) cudaStreamDestroy(stream);
       pipeline = std::move(o.pipeline);
       stream = o.stream;
+      nvjpeg = std::move(o.nvjpeg);
       o.stream = nullptr;
     }
     return *this;

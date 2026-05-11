@@ -77,7 +77,7 @@ void register_ocr_raw_route_gpu(server::WorkPool &pool,
         // JPEG with nvJPEG: submit GPU-direct decode + infer as one work item
         if (nvjpeg_available && NvJpegDecoder::is_jpeg(data, len)) {
           auto out = dispatcher.submit([data, len, opts](auto &e) {
-            thread_local NvJpegDecoder nvjpeg;
+            auto &nvjpeg = e.get_nvjpeg();
             auto [w, h] = nvjpeg.get_dimensions(data, len);
             if (w > 0 && h > 0) {
               auto [d_buf, pitch] = e.pipeline->ensure_gpu_buf(h, w);
