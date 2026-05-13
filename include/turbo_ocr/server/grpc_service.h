@@ -20,6 +20,8 @@
 #include "turbo_ocr/decode/image_config.h"
 #include "turbo_ocr/decode/image_dims.h"
 #include "turbo_ocr/server/env_utils.h"
+#include "turbo_ocr/server/grpc_response_mode.h"
+#include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/decode/fast_png_decoder.h"
 #ifndef USE_CPU_ONLY
 #include "turbo_ocr/decode/nvjpeg_decoder.h"
@@ -34,8 +36,6 @@
 #include "ocr.grpc.pb.h"
 
 namespace turbo_ocr::server {
-
-enum class GrpcResponseMode { json_bytes, structured };
 
 // Helper: stamp the structured HTTP-parity error code into gRPC trailing
 // metadata under "x-error-code" and return the status. Keeps the legacy
@@ -157,28 +157,30 @@ class OCRServiceImpl final : public ocr::OCRService::Service {
 public:
 #ifndef USE_CPU_ONLY
   OCRServiceImpl(pipeline::PipelineDispatcher &dispatcher,
-                 GrpcResponseMode mode,
-                 render::PdfRenderer *pdf_renderer = nullptr,
-                 pdf::PdfMode default_pdf_mode = pdf::PdfMode::Ocr,
-                 bool layout_available = false)
+                 const ServerConfig &cfg,
+                 render::PdfRenderer *pdf_renderer,
+                 bool layout_available)
       : dispatcher_(&dispatcher),
-        mode_(mode),
+        mode_(cfg.grpc_response_mode),
         pdf_renderer_(pdf_renderer),
-        default_pdf_mode_(default_pdf_mode),
-        layout_available_(layout_available) {}
+        default_pdf_mode_(cfg.default_pdf_mode),
+        layout_available_(layout_available),
+        grpc_batch_workers_(cfg.grpc_batch_workers),
+        max_pdf_pages_(cfg.max_pdf_pages) {}
 #endif
 
   /// CPU-friendly constructor: takes an InferFunc instead of a dispatcher.
   OCRServiceImpl(InferFunc infer_fn,
-                 GrpcResponseMode mode,
-                 render::PdfRenderer *pdf_renderer = nullptr,
-                 pdf::PdfMode default_pdf_mode = pdf::PdfMode::Ocr,
-                 bool layout_available = false)
+                 const ServerConfig &cfg,
+                 render::PdfRenderer *pdf_renderer,
+                 bool layout_available)
       : infer_fn_(std::move(infer_fn)),
-        mode_(mode),
+        mode_(cfg.grpc_response_mode),
         pdf_renderer_(pdf_renderer),
-        default_pdf_mode_(default_pdf_mode),
-        layout_available_(layout_available) {}
+        default_pdf_mode_(cfg.default_pdf_mode),
+        layout_available_(layout_available),
+        grpc_batch_workers_(cfg.grpc_batch_workers),
+        max_pdf_pages_(cfg.max_pdf_pages) {}
 
   /// Set the readiness probe used by Health(). Same signature as the
   /// HTTP /health/ready check; called once per Health RPC. nullptr
@@ -462,8 +464,7 @@ public:
 
     // CPU-only fanout: bounded jthread pool, each thread calls run_infer
     // (which is synchronous through the InferFunc on this build).
-    static const int requested_workers = env_int("GRPC_BATCH_WORKERS", 8, 1, 256);
-    const int num_workers = std::min(n, requested_workers);
+    const int num_workers = std::min(n, grpc_batch_workers_);
     std::atomic<int> next_idx{0};
     {
       std::vector<std::jthread> workers;
@@ -534,7 +535,7 @@ public:
     auto probe = std::make_unique<pdf::PdfDocument>(pdf_data, pdf_len);
     if (probe->ok()) {
       const int np_check = probe->page_count();
-      static const int limit = env_int("MAX_PDF_PAGES", 2000, 1, 100000);
+      const int limit = max_pdf_pages_;
       if (np_check > limit) {
         return grpc_error(ctx, grpc::StatusCode::INVALID_ARGUMENT,
             "PDF_TOO_LARGE",
@@ -920,6 +921,8 @@ private:
   render::PdfRenderer *pdf_renderer_ = nullptr;
   pdf::PdfMode default_pdf_mode_ = pdf::PdfMode::Ocr;
   bool layout_available_ = false;
+  int grpc_batch_workers_ = 8;
+  int max_pdf_pages_ = 2000;
 };
 
 /// Start gRPC server on a background thread. Returns the server and thread.
@@ -932,10 +935,10 @@ struct GrpcHandle {
 namespace detail {
 
 inline GrpcHandle launch_grpc_server(std::shared_ptr<OCRServiceImpl> service,
-                                      int port) {
-  // Track the same MAX_BODY_MB env var the HTTP path uses so gRPC and HTTP
-  // agree on the body cap. Default 100 MB matches historical behaviour.
-  int max_body_mb = turbo_ocr::server::env_int("MAX_BODY_MB", 100, 1, 102400);
+                                      int port, const ServerConfig &cfg) {
+  // MAX_BODY_MB and GRPC_CQS now sourced from ServerConfig — the HTTP path
+  // pulls from the same cfg so gRPC and HTTP body caps cannot drift.
+  const int max_body_mb = cfg.max_body_mb;
   // Compute in int64 so MAX_BODY_MB=2048 (= 2^31 bytes) doesn't wrap
   // signed int. gRPC's SetMax{Receive,Send}MessageSize takes int, so
   // clamp to INT_MAX (~2 GiB) — operators wanting more must split
@@ -943,11 +946,9 @@ inline GrpcHandle launch_grpc_server(std::shared_ptr<OCRServiceImpl> service,
   const int64_t max_msg64 = static_cast<int64_t>(max_body_mb) * 1024 * 1024;
   const int max_msg = static_cast<int>(
       std::min<int64_t>(max_msg64, std::numeric_limits<int>::max()));
-  int cqs = 10;
-  if (const char *env = std::getenv("GRPC_CQS"))
-    cqs = std::max(1, std::atoi(env));
+  const int cqs = cfg.grpc_cqs;
 
-  auto address = std::format("0.0.0.0:{}", port);
+  auto address = std::format("{}:{}", cfg.host, port);
 
   grpc::ServerBuilder builder;
   builder.AddListeningPort(address, grpc::InsecureServerCredentials());
@@ -978,41 +979,27 @@ inline GrpcHandle launch_grpc_server(std::shared_ptr<OCRServiceImpl> service,
 /// `readiness_check` is invoked from Health() so gRPC probes match
 /// HTTP /health/ready behaviour. Pass {} to keep Health unconditionally OK.
 inline GrpcHandle start_grpc_server(pipeline::PipelineDispatcher &dispatcher,
-                                     int port,
+                                     const ServerConfig &cfg,
                                      render::PdfRenderer *pdf_renderer = nullptr,
-                                     pdf::PdfMode default_pdf_mode = pdf::PdfMode::Ocr,
                                      bool layout_available = false,
                                      std::function<bool()> readiness_check = {}) {
-  auto mode = GrpcResponseMode::json_bytes;
-  if (const char *env = std::getenv("GRPC_RESPONSE_MODE")) {
-    if (std::strcmp(env, "structured") == 0)
-      mode = GrpcResponseMode::structured;
-  }
-
   auto service = std::make_shared<OCRServiceImpl>(
-      dispatcher, mode, pdf_renderer, default_pdf_mode, layout_available);
+      dispatcher, cfg, pdf_renderer, layout_available);
   service->set_readiness_check(std::move(readiness_check));
-  return detail::launch_grpc_server(std::move(service), port);
+  return detail::launch_grpc_server(std::move(service), cfg.grpc_port, cfg);
 }
 #endif
 
 /// Start gRPC server using an InferFunc (CPU path, also usable from GPU).
 inline GrpcHandle start_grpc_server(InferFunc infer_fn,
-                                     int port,
+                                     const ServerConfig &cfg,
                                      render::PdfRenderer *pdf_renderer = nullptr,
-                                     pdf::PdfMode default_pdf_mode = pdf::PdfMode::Ocr,
                                      bool layout_available = false,
                                      std::function<bool()> readiness_check = {}) {
-  auto mode = GrpcResponseMode::json_bytes;
-  if (const char *env = std::getenv("GRPC_RESPONSE_MODE")) {
-    if (std::strcmp(env, "structured") == 0)
-      mode = GrpcResponseMode::structured;
-  }
-
   auto service = std::make_shared<OCRServiceImpl>(
-      std::move(infer_fn), mode, pdf_renderer, default_pdf_mode, layout_available);
+      std::move(infer_fn), cfg, pdf_renderer, layout_available);
   service->set_readiness_check(std::move(readiness_check));
-  return detail::launch_grpc_server(std::move(service), port);
+  return detail::launch_grpc_server(std::move(service), cfg.grpc_port, cfg);
 }
 
 } // namespace turbo_ocr::server

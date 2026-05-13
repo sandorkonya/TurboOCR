@@ -85,7 +85,7 @@ Turbo-OCR vs PaddleOCR · EasyOCR · VLMs — FUNSD (50 pages, RTX 5090)
 ```bash
 docker run --gpus all -p 8000:8000 -p 50051:50051 \
   -v trt-cache:/home/ocr/.cache/turbo-ocr \
-  ghcr.io/aiptimizer/turboocr:v2.2.3
+  ghcr.io/aiptimizer/turboocr:v2.3.0
 ```
 
 First startup builds TensorRT engines from ONNX (~90s). The volume caches them for instant restarts. nginx (port 8000) reverse-proxies to Drogon (port 8080) for connection buffering — both start automatically.
@@ -368,25 +368,41 @@ Reproduce: `python tests/benchmark/comparison/bench_turbo_ocr.py` (requires runn
 | `DET_MAX_SIDE` | `960` | Max detection input side (px). Bounds: 32–4096. The TRT engine profile is built to match this value; changing it invalidates the cached engine and triggers a one-time rebuild. |
 | `TRT_OPT_LEVEL` | `5` | TensorRT builder optimization level. Bounds: 0–5. Lower values trade runtime perf for faster cold builds (`3` typically builds ~3-5× faster with <5% runtime regression). The cache key includes the level, so different values produce separate engines. |
 | `TRT_ENGINE_CACHE` | `~/.cache/turbo-ocr` | Directory for cached TensorRT engines. Set to a host-mounted path to share engines across container restarts. |
-| `PORT` / `GRPC_PORT` | `8000` / `50051` | Server ports |
+| `TURBO_OCR_HOST` | `0.0.0.0` | Bind address for HTTP and gRPC listeners. Default binds every IPv4 interface; use `127.0.0.1` for loopback only, `::` for all interfaces incl. IPv6, or a specific interface IP. Equivalent CLI flag: `--host`. |
+| `PORT` / `GRPC_PORT` | `8080` / `50051` | Server ports. The binary listens on `PORT=8080` by default; the Docker image runs nginx in front of it on port `8000`, so external clients use `8000` and `PORT` only matters for direct/native runs. |
 | `PDF_DAEMONS` / `PDF_WORKERS` | `16` / `4` | PDF render parallelism |
 | `GRPC_BATCH_WORKERS` | `8` | Parallel workers in gRPC `RecognizeBatch` for fan-out across pipeline pool |
 | `HTTP_THREADS` | `pool * 32` | Work pool threads for blocking inference |
 | `MAX_PDF_PAGES` | `2000` | Maximum pages per PDF request |
+| `SHUTDOWN_GRACE_SECONDS` | `30` | Seconds to wait for inflight requests to drain on SIGTERM/SIGINT before tearing down. Set to stay below your orchestrator's SIGKILL grace (K8s default 30s). |
+| `GRPC_CQS` | `10` | Number of gRPC completion queues. Higher values trade memory for connection-handling parallelism on high-fanout deployments. |
+| `GRPC_RESPONSE_MODE` | `json_bytes` | gRPC response format: `json_bytes` (default — full JSON in `json_response` field) or `structured` (typed protobuf fields). |
 | `MAX_BODY_MB` | `100` | Max request body size in MB. Applied at all three layers: nginx (413 at proxy), Drogon HTTP (`setClientMaxBodySize`), and gRPC (`SetMaxReceive/SendMessageSize`). Bounds: 1–102400. |
-| `MAX_BODY_MEMORY_MB` | `1024` | Per-request in-memory buffer threshold. Bodies up to this size stay in RAM; larger ones spill to a tempfile under `/tmp`. The default keeps every body in RAM until `MAX_BODY_MB` is raised past 1 GiB. Lower on memory-constrained hosts (e.g. `MAX_BODY_MEMORY_MB=50` caps buffer RSS at ~50 MB × concurrent requests). Clamped to `[1, MAX_BODY_MB]`. |
+| `MAX_BODY_MEMORY_MB` | `min(1024, MAX_BODY_MB)` — effectively `100` with stock config | Per-request in-memory buffer threshold. Bodies up to this size stay in RAM; larger ones spill to a tempfile under `/tmp`. Always clamped to `[1, MAX_BODY_MB]`, so the effective default tracks `MAX_BODY_MB`. Raise `MAX_BODY_MB` first to unlock larger in-memory buffers. Lower on memory-constrained hosts (e.g. `MAX_BODY_MEMORY_MB=50` caps buffer RSS at ~50 MB × concurrent requests). |
 | `MAX_IMAGE_DIM` | `16384` | Max width or height (px) accepted on `/ocr/pixels` and image-decode routes. Bounds: 64–65535. |
 | `LOG_LEVEL` | `info` | Log level: `debug` / `info` / `warn` / `error` |
 | `LOG_FORMAT` | `json` | Log format: `json` (structured) / `text` (human-readable) |
 | `TOCR_LOG_RATELIMIT` | `10` | Max rate-limited logs per call site per 1s window (applies to per-request error paths). `0` disables. Format `N` or `N:W_MS` (e.g. `5:2000` = 5 logs / 2s). On window roll a single `[suppressed logs]` rollup line is emitted. |
 
+Every knob above is also exposed as a CLI flag (`--http-port`, `--max-body-mb`, `--disable-layout`, `--det-max-side`, `--log-level`, etc.). The two exceptions, which remain env-only because their valid set is context-dependent, are `OCR_LANG` (validated against installed model bundles at first request) and `TOCR_LOG_RATELIMIT` (custom `N` or `N:W_MS` format). CLI flags override env vars when both are set. Useful flags for inspection:
+
+```
+paddle_highspeed_cpp --help            # full flag listing
+paddle_highspeed_cpp --print-config    # resolved JSON config; exit 0
+paddle_highspeed_cpp --check-config    # validate only; exit 0 on valid, 2 on errors
+```
+
+Malformed env vars or out-of-range values cause startup to fail with a clear error list — the server refuses to bind rather than silently coerce bad input (e.g. `PORT=abc` used to become `1`; it now exits with `[config error] PORT="abc" is not a valid integer`). Validate config without booting the pipeline using `--check-config`.
+
 Layout detection is **enabled by default**. The model is loaded at startup but only runs when a request includes `?layout=1`. Requests without `?layout=1` have zero overhead. Requests with `?layout=1` reduce throughput by ~20%. Set `DISABLE_LAYOUT=1` to skip loading the model entirely and save ~300-500 MB VRAM.
+
+> **Migration note (v2.3+):** The legacy `ENABLE_LAYOUT` env var has been removed. If set, startup fails with a clear error — use `DISABLE_LAYOUT=1` to disable layout, or remove the var (layout is on by default).
 
 ```bash
 docker run --gpus all -p 8000:8000 \
   -v trt-cache:/home/ocr/.cache/turbo-ocr \
   -e PIPELINE_POOL_SIZE=3 \
-  ghcr.io/aiptimizer/turboocr:v2.2.3
+  ghcr.io/aiptimizer/turboocr:v2.3.0
 ```
 
 Add `MAX_PDF_PAGES` (default `2000`) to limit the number of pages processed per PDF request. `LOG_LEVEL` (`debug`/`info`/`warn`/`error`) and `LOG_FORMAT` (`json`/`text`) control structured logging output.
@@ -506,7 +522,7 @@ Set via the `OCR_LANG` environment variable. Every supported language bundle is 
 docker run --gpus all -p 8000:8000 -p 50051:50051 \
   -v trt-cache:/home/ocr/.cache/turbo-ocr \
   -e OCR_LANG=chinese \
-  ghcr.io/aiptimizer/turboocr:v2.2.2
+  ghcr.io/aiptimizer/turboocr:v2.3.0
 ```
 
 > **Volume tip:** use a **named** volume (`trt-cache:`) as shown above, not a

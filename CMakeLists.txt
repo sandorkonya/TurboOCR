@@ -102,22 +102,44 @@ add_executable(turbo_ocr_tests
     tests/cpp/test_image_dims.cpp
     tests/cpp/test_xy_cut.cpp
     tests/cpp/test_logger_ratelimit.cpp
+    tests/cpp/test_server_config.cpp
     src/render/pdf_renderer.cpp
     third_party/catch2/catch_amalgamated.cpp
 )
 target_link_libraries(turbo_ocr_tests PRIVATE turbo_ocr_common)
 target_include_directories(turbo_ocr_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/catch2
+    ${CMAKE_SOURCE_DIR}/third_party/cli11
 )
 target_compile_options(turbo_ocr_tests PRIVATE ${TURBO_OCR_CXX_FLAGS})
 
 if(USE_CPU_ONLY)
     message(STATUS "Building CPU-ONLY mode (ONNX Runtime backend)")
 
-    find_library(ONNXRUNTIME_LIB onnxruntime HINTS /usr/local/lib)
-    if(NOT ONNXRUNTIME_LIB)
-        message(FATAL_ERROR "ONNX Runtime not found")
+    # Prefer system-installed ORT (Dockerfile installs to /usr/local/lib).
+    # If not found, FetchContent downloads the same pinned tarball as
+    # docker/Dockerfile.cpu so native CPU builds stay reproducible.
+    find_library(ONNXRUNTIME_LIB onnxruntime
+        HINTS /usr/local/lib ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib)
+    find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+        HINTS /usr/local/include ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include)
+    if(NOT ONNXRUNTIME_LIB OR NOT ONNXRUNTIME_INCLUDE_DIR)
+        include(FetchContent)
+        set(ORT_VERSION "1.22.0" CACHE STRING "ONNX Runtime version to fetch")
+        set(ORT_SHA256 "8344d55f93d5bc5021ce342db50f62079daf39aaafb5d311a451846228be49b3")
+        message(STATUS "ONNX Runtime not found; fetching v${ORT_VERSION}")
+        FetchContent_Declare(onnxruntime_prebuilt
+            URL      https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz
+            URL_HASH SHA256=${ORT_SHA256}
+            SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/onnxruntime
+        )
+        FetchContent_MakeAvailable(onnxruntime_prebuilt)
+        find_library(ONNXRUNTIME_LIB onnxruntime
+            HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/lib REQUIRED)
+        find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+            HINTS ${CMAKE_SOURCE_DIR}/third_party/onnxruntime/include REQUIRED)
     endif()
+    message(STATUS "ONNX Runtime: ${ONNXRUNTIME_LIB}")
 
     # Protobuf + gRPC (same discovery logic as GPU build)
     find_package(Protobuf REQUIRED)
@@ -167,6 +189,7 @@ if(USE_CPU_ONLY)
     )
     target_include_directories(turbo_ocr_cpu PUBLIC
         ${CMAKE_SOURCE_DIR}/third_party/pdfium/include
+        ${ONNXRUNTIME_INCLUDE_DIR}
     )
     target_link_libraries(turbo_ocr_cpu PUBLIC turbo_ocr_common ${ONNXRUNTIME_LIB}
         ${CMAKE_SOURCE_DIR}/third_party/pdfium/lib/libpdfium.so pthread)
@@ -182,7 +205,10 @@ if(USE_CPU_ONLY)
         ${PROTO_GEN_CC}
         ${GRPC_GEN_CC}
     )
-    target_include_directories(paddle_cpu_server PRIVATE ${PROTO_GEN_DIR})
+    target_include_directories(paddle_cpu_server PRIVATE
+        ${PROTO_GEN_DIR}
+        ${CMAKE_SOURCE_DIR}/third_party/cli11
+    )
     target_link_libraries(paddle_cpu_server PRIVATE
         turbo_ocr_cpu
         Drogon::Drogon
@@ -307,7 +333,10 @@ else()
         ${PROTO_GEN_CC}
         ${GRPC_GEN_CC}
     )
-    target_include_directories(paddle_highspeed_cpp PRIVATE ${PROTO_GEN_DIR})
+    target_include_directories(paddle_highspeed_cpp PRIVATE
+        ${PROTO_GEN_DIR}
+        ${CMAKE_SOURCE_DIR}/third_party/cli11
+    )
     target_link_libraries(paddle_highspeed_cpp PRIVATE
         turbo_ocr_gpu
         Drogon::Drogon

@@ -24,6 +24,7 @@
 #include "turbo_ocr/server/grpc_service.h"
 #include "turbo_ocr/server/language_paths.h"
 #include "turbo_ocr/server/metrics.h"
+#include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/server/server_types.h"
 #include "turbo_ocr/server/work_pool.h"
 #include "turbo_ocr/routes/common_routes.h"
@@ -34,14 +35,16 @@ using turbo_ocr::OCRResultItem;
 using turbo_ocr::base64_decode;
 using turbo_ocr::results_to_json;
 using turbo_ocr::emit_results_json;
-using turbo_ocr::server::env_or;
 
 namespace {
 std::atomic<bool> g_shutdown_requested{false};
 turbo_ocr::server::WorkPool *g_work_pool_for_drain = nullptr;
+// Atomic because the signal handler may fire on a different thread than
+// the writer in main().
+std::atomic<int> g_shutdown_grace_seconds{30};
 
 int shutdown_grace_seconds() {
-  return turbo_ocr::server::env_int("SHUTDOWN_GRACE_SECONDS", 30, 0, 600);
+  return g_shutdown_grace_seconds.load(std::memory_order_acquire);
 }
 
 // Mirrors the GPU binary: graceful drain of WorkPool inflight before
@@ -63,19 +66,24 @@ void begin_graceful_shutdown(const char *signal_name) {
 }
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   TOCR_LOG_INFO("PaddleOCR CPU-Only Mode (ONNX Runtime)");
 
-  auto rec_paths = turbo_ocr::server::resolve_rec_paths("REC_MODEL");
-  if (auto lang = turbo_ocr::server::ocr_lang(); !lang.empty())
+  const auto cfg = turbo_ocr::server::ServerConfig::load_or_die(argc, argv);
+  cfg.log_effective();
+  g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
+                                  std::memory_order_release);
+
+  const auto &rec_paths = cfg.rec_paths;
+  if (!cfg.ocr_lang_value.empty())
     TOCR_LOG_INFO("Language selected via OCR_LANG",
-                  "lang",  std::string_view(lang),
+                  "lang",  std::string_view(cfg.ocr_lang_value),
                   "rec",   std::string_view(rec_paths.rec),
                   "dict",  std::string_view(rec_paths.dict));
-  auto det_model = env_or("DET_MODEL", "models/det.onnx");
+  auto det_model = cfg.det_onnx;
   auto rec_model = rec_paths.rec;
-  auto rec_dict = rec_paths.dict;
-  auto cls_model = env_or("CLS_MODEL", "models/cls.onnx");
+  auto rec_dict  = rec_paths.dict;
+  auto cls_model = cfg.cls_onnx;
 
   // Validate model paths up front so a missing models/ tree fails fast
   // with a clear error rather than tripping a confusing ORT load failure
@@ -96,20 +104,18 @@ int main() {
   require_model(rec_dict, "REC_DICT");
   require_model(cls_model, "CLS");
 
-  if (turbo_ocr::server::env_enabled("DISABLE_ANGLE_CLS")) {
+  if (cfg.disable_angle_cls) {
     cls_model.clear();
     TOCR_LOG_INFO("Angle classification disabled via DISABLE_ANGLE_CLS=1");
   }
 
   // Layout model (CPU via ONNX Runtime) — on by default. Optional: a
   // missing layout.onnx soft-disables the stage below rather than aborting.
-  std::string layout_model = env_or("LAYOUT_ONNX", "models/layout/layout.onnx");
-  bool layout_disabled = turbo_ocr::server::env_enabled("DISABLE_LAYOUT");
+  std::string layout_model = cfg.layout_onnx;
+  const bool layout_disabled = cfg.layout_disabled;
   bool layout_available = false;
 
-  int pool_size = 4;
-  if (const char *env = std::getenv("PIPELINE_POOL_SIZE"))
-    pool_size = std::max(1, std::atoi(env));
+  const int pool_size = cfg.pipeline_pool_size.value_or(4);
 
   TOCR_LOG_INFO("CPU pipeline pool size", "pool_size", pool_size);
   auto pool = turbo_ocr::pipeline::make_cpu_pipeline_pool(
@@ -248,18 +254,13 @@ int main() {
       {drogon::Post});
 
   // --- /ocr/pdf endpoint (CPU: sequential page OCR) ---
-  int pdf_daemons = 4, pdf_workers = 2;
-  if (const char *env = std::getenv("PDF_DAEMONS"))
-    pdf_daemons = std::max(1, std::atoi(env));
-  if (const char *env = std::getenv("PDF_WORKERS"))
-    pdf_workers = std::max(1, std::atoi(env));
+  const int pdf_daemons = cfg.pdf_daemons;
+  const int pdf_workers = cfg.pdf_workers;
   turbo_ocr::render::PdfRenderer pdf_renderer(pdf_daemons, pdf_workers);
   TOCR_LOG_INFO("PDF renderer initialized", "daemons", pdf_daemons, "workers", pdf_workers);
   turbo_ocr::pdf::ensure_pdfium_initialized();
 
-  turbo_ocr::pdf::PdfMode default_pdf_mode = turbo_ocr::pdf::PdfMode::Ocr;
-  if (auto *m = std::getenv("ENABLE_PDF_MODE"); m && *m)
-    default_pdf_mode = turbo_ocr::pdf::parse_pdf_mode(m);
+  const turbo_ocr::pdf::PdfMode default_pdf_mode = cfg.default_pdf_mode;
 
   turbo_ocr::routes::register_pdf_route(work_pool, infer, pdf_renderer, default_pdf_mode, layout_available);
 
@@ -454,17 +455,11 @@ int main() {
       {drogon::Post});
 
   // gRPC server
-  int grpc_port = 50051;
-  if (const char *env = std::getenv("GRPC_PORT"))
-    grpc_port = std::max(1, std::atoi(env));
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
-      infer, grpc_port, &pdf_renderer, default_pdf_mode, layout_available,
-      readiness);
+      infer, cfg, &pdf_renderer, layout_available, readiness);
 
   // HTTP server (Drogon)
-  int port = 8080;
-  if (const char *env = std::getenv("PORT"))
-    port = std::max(1, std::atoi(env));
+  const int port = cfg.http_port;
 
   // MAX_BODY_MB caps the largest accepted upload (default 100).
   // MAX_BODY_MEMORY_MB tunes the in-memory buffer threshold (default
@@ -472,15 +467,14 @@ int main() {
   // clamped to MAX_BODY_MB below, so the default keeps every body in
   // RAM until the operator raises MAX_BODY_MB past 1 GiB. See main.cpp
   // for the full rationale — same knob on both CPU and GPU servers.
-  int max_body_mb = turbo_ocr::server::env_int("MAX_BODY_MB", 100, 1, 102400);
-  int max_body_mem_mb = turbo_ocr::server::env_int(
-      "MAX_BODY_MEMORY_MB", 1024, 1, 102400);
+  const int max_body_mb = cfg.max_body_mb;
+  int max_body_mem_mb = cfg.max_body_mem_mb;
   if (max_body_mem_mb > max_body_mb) max_body_mem_mb = max_body_mb;
   size_t max_body_bytes = static_cast<size_t>(max_body_mb) * 1024 * 1024;
   size_t max_mem_bytes  = static_cast<size_t>(max_body_mem_mb) * 1024 * 1024;
 
   TOCR_LOG_INFO("Starting CPU-Only OCR Server", "port", port, "grpc_port",
-                grpc_port, "body_cap_mb_drogon", max_body_mb,
+                cfg.grpc_port, "body_cap_mb_drogon", max_body_mb,
                 "body_cap_mb_nginx", max_body_mb, "body_mem_mb", max_body_mem_mb);
 
   // Graceful shutdown on SIGTERM (Docker / K8s) and SIGINT (Ctrl-C):
@@ -489,7 +483,7 @@ int main() {
   drogon::app()
       .setTermSignalHandler([] { begin_graceful_shutdown("SIGTERM"); })
       .setIntSignalHandler([]  { begin_graceful_shutdown("SIGINT");  })
-      .addListener("0.0.0.0", port)
+      .addListener(cfg.host, port)
       .setThreadNum(4)
       .setIdleConnectionTimeout(120)
       .setClientMaxBodySize(max_body_bytes)
