@@ -27,6 +27,7 @@
 #include "turbo_ocr/server/grpc_service.h"
 #include "turbo_ocr/server/language_paths.h"
 #include "turbo_ocr/server/metrics.h"
+#include "turbo_ocr/server/server_config.h"
 #include "turbo_ocr/server/server_types.h"
 #include "turbo_ocr/server/work_pool.h"
 #include "turbo_ocr/routes/common_routes.h"
@@ -36,17 +37,17 @@
 using turbo_ocr::decode::FastPngDecoder;
 using turbo_ocr::decode::NvJpegDecoder;
 using turbo_ocr::render::PdfRenderer;
-using turbo_ocr::server::env_or;
 
 namespace {
 std::atomic<bool> g_shutdown_requested{false};
 turbo_ocr::server::WorkPool *g_work_pool_for_drain = nullptr;
+// Atomic because the signal handler may fire on a different thread than
+// the writer in main(). Default 30 matches today's behaviour in case the
+// signal fires before main() has finished assigning it.
+std::atomic<int> g_shutdown_grace_seconds{30};
 
-// Default 30s ceiling — long enough for a typical PDF inflight to finish,
-// short enough to stay below the standard 30s SIGKILL grace in K8s minus
-// signal-propagation slop. Override with SHUTDOWN_GRACE_SECONDS.
 int shutdown_grace_seconds() {
-  return turbo_ocr::server::env_int("SHUTDOWN_GRACE_SECONDS", 30, 0, 600);
+  return g_shutdown_grace_seconds.load(std::memory_order_acquire);
 }
 
 // Runs from Drogon's main loop (registered via setTermSignalHandler) —
@@ -70,11 +71,16 @@ void begin_graceful_shutdown(const char *signal_name) {
 }
 } // namespace
 
-int main() {
-  auto rec_paths = turbo_ocr::server::resolve_rec_paths("REC_ONNX");
-  if (auto lang = turbo_ocr::server::ocr_lang(); !lang.empty())
+int main(int argc, char **argv) {
+  const auto cfg = turbo_ocr::server::ServerConfig::load_or_die(argc, argv);
+  cfg.log_effective();
+  g_shutdown_grace_seconds.store(cfg.shutdown_grace_seconds,
+                                  std::memory_order_release);
+
+  const auto &rec_paths = cfg.rec_paths;
+  if (!cfg.ocr_lang_value.empty())
     TOCR_LOG_INFO("Language selected via OCR_LANG",
-                  "lang",  std::string_view(lang),
+                  "lang",  std::string_view(cfg.ocr_lang_value),
                   "rec",   std::string_view(rec_paths.rec),
                   "dict",  std::string_view(rec_paths.dict));
   auto rec_dict = rec_paths.dict;
@@ -94,40 +100,34 @@ int main() {
       std::exit(1);
     }
   };
-  require_model(env_or("DET_ONNX", "models/det.onnx"), "DET");
+  require_model(cfg.det_onnx, "DET");
   require_model(rec_paths.rec, "REC");
-  require_model(env_or("CLS_ONNX", "models/cls.onnx"), "CLS");
+  require_model(cfg.cls_onnx, "CLS");
 
   // Auto-build TRT engines from ONNX (cached by TRT version + model hash)
   // Sweep orphan .trt.tmp.* files left by previous crashed processes; safe
   // because in-progress builds by sibling replicas are protected by the
   // 60-second min-age window inside the sweeper.
   turbo_ocr::engine::sweep_orphan_engine_temps();
-  auto det_model = turbo_ocr::engine::ensure_trt_engine(
-      env_or("DET_ONNX", "models/det.onnx"), "det");
+  auto det_model = turbo_ocr::engine::ensure_trt_engine(cfg.det_onnx, "det");
   auto rec_model = turbo_ocr::engine::ensure_trt_engine(rec_paths.rec, "rec");
-  auto cls_model = turbo_ocr::engine::ensure_trt_engine(
-      env_or("CLS_ONNX", "models/cls.onnx"), "cls");
-  if (turbo_ocr::server::env_enabled("DISABLE_ANGLE_CLS")) {
+  auto cls_model = turbo_ocr::engine::ensure_trt_engine(cfg.cls_onnx, "cls");
+  if (cfg.disable_angle_cls) {
     cls_model.clear();
     TOCR_LOG_INFO("Angle classification disabled via DISABLE_ANGLE_CLS=1");
   }
 
   // Optional PP-DocLayoutV3 stage. ON by default — users can disable with
-  // DISABLE_LAYOUT=1 to save ~300-500 MB VRAM. Also accepts legacy
-  // ENABLE_LAYOUT=0 to disable.
+  // DISABLE_LAYOUT=1 to save ~300-500 MB VRAM.
   std::string layout_model;
-  bool layout_disabled = turbo_ocr::server::env_enabled("DISABLE_LAYOUT") ||
-                          (std::getenv("ENABLE_LAYOUT") && !turbo_ocr::server::env_enabled("ENABLE_LAYOUT"));
-  if (!layout_disabled) {
-    if (auto *pre = std::getenv("LAYOUT_TRT"); pre && *pre) {
-      layout_model = pre;
+  if (!cfg.layout_disabled) {
+    if (cfg.layout_trt && !cfg.layout_trt->empty()) {
+      layout_model = *cfg.layout_trt;
       TOCR_LOG_INFO("Layout detection enabled", "engine", std::string_view(layout_model));
     } else {
       // Layout ONNX is optional — soft-disable with a warning if missing
       // rather than hard-failing, so installs without layout still serve.
-      layout_model = turbo_ocr::engine::ensure_trt_engine(
-          env_or("LAYOUT_ONNX", "models/layout/layout.onnx"), "layout");
+      layout_model = turbo_ocr::engine::ensure_trt_engine(cfg.layout_onnx, "layout");
       if (layout_model.empty()) {
         TOCR_LOG_WARN("Layout model (layout.onnx) not found; layout stage will be disabled");
       } else {
@@ -139,9 +139,8 @@ int main() {
   }
 
   // PDF extraction mode default
-  turbo_ocr::pdf::PdfMode default_pdf_mode = turbo_ocr::pdf::PdfMode::Ocr;
-  if (auto *m = std::getenv("ENABLE_PDF_MODE"); m && *m) {
-    default_pdf_mode = turbo_ocr::pdf::parse_pdf_mode(m);
+  const turbo_ocr::pdf::PdfMode default_pdf_mode = cfg.default_pdf_mode;
+  if (cfg.default_pdf_mode_was_set) {
     TOCR_LOG_INFO("PDF extraction default mode configured", "mode", turbo_ocr::pdf::mode_name(default_pdf_mode));
   } else {
     TOCR_LOG_INFO("PDF extraction default mode: ocr (override per-request with /ocr/pdf?mode=<geometric|auto|auto_verified>)");
@@ -150,8 +149,8 @@ int main() {
 
   // Pipeline pool
   int pool_size = 4;
-  if (const char *env = std::getenv("PIPELINE_POOL_SIZE")) {
-    pool_size = std::max(1, std::atoi(env));
+  if (cfg.pipeline_pool_size) {
+    pool_size = *cfg.pipeline_pool_size;
   } else {
     size_t free_mem = 0, total_mem = 0;
     if (cudaMemGetInfo(&free_mem, &total_mem) == cudaSuccess) {
@@ -168,11 +167,8 @@ int main() {
       pool_size, det_model, rec_model, rec_dict, cls_model, layout_model);
 
   // PDF renderer
-  int pdf_daemons = 16, pdf_workers = 4;
-  if (const char *env = std::getenv("PDF_DAEMONS"))
-    pdf_daemons = std::max(1, std::atoi(env));
-  if (const char *env = std::getenv("PDF_WORKERS"))
-    pdf_workers = std::max(1, std::atoi(env));
+  const int pdf_daemons = cfg.pdf_daemons;
+  const int pdf_workers = cfg.pdf_workers;
   PdfRenderer pdf_renderer(pdf_daemons, pdf_workers);
   TOCR_LOG_INFO("PDF renderer initialized", "daemons", pdf_daemons, "workers", pdf_workers);
 
@@ -228,8 +224,7 @@ int main() {
 
   // Work pool for offloading blocking inference from Drogon event loop
   int work_threads = std::max(pool_size * 32, 128);
-  if (const char *env = std::getenv("HTTP_THREADS"))
-    work_threads = std::max(1, std::atoi(env));
+  if (cfg.http_threads) work_threads = *cfg.http_threads;
   turbo_ocr::server::WorkPool work_pool(work_threads);
 
   // --- Register all routes ---
@@ -283,17 +278,11 @@ int main() {
   turbo_ocr::routes::register_pdf_route(work_pool, *dispatcher, pdf_renderer, default_pdf_mode, layout_available);
 
   // gRPC
-  int grpc_port = 50051;
-  if (const char *env = std::getenv("GRPC_PORT"))
-    grpc_port = std::max(1, std::atoi(env));
   auto grpc_handle = turbo_ocr::server::start_grpc_server(
-      *dispatcher, grpc_port, &pdf_renderer, default_pdf_mode, layout_available,
-      readiness);
+      *dispatcher, cfg, &pdf_renderer, layout_available, readiness);
 
   // HTTP (Drogon) — behind nginx (port 8000), direct access on 8080
-  int port = 8080;
-  if (const char *env = std::getenv("PORT"))
-    port = std::max(1, std::atoi(env));
+  const int port = cfg.http_port;
   int io_threads = std::max(pool_size, 4);
 
   // MAX_BODY_MB caps the largest accepted upload (default 100). Same env
@@ -306,9 +295,8 @@ int main() {
   // the memory cap is clamped to the total cap below. Lower it on
   // memory-constrained hosts (e.g. MAX_BODY_MEMORY_MB=50 caps body
   // buffer RSS at ~50 MB × concurrent_requests).
-  int max_body_mb = turbo_ocr::server::env_int("MAX_BODY_MB", 100, 1, 102400);
-  int max_body_mem_mb = turbo_ocr::server::env_int(
-      "MAX_BODY_MEMORY_MB", 1024, 1, 102400);
+  const int max_body_mb = cfg.max_body_mb;
+  int max_body_mem_mb = cfg.max_body_mem_mb;
   if (max_body_mem_mb > max_body_mb) max_body_mem_mb = max_body_mb;
   size_t max_body_bytes = static_cast<size_t>(max_body_mb) * 1024 * 1024;
   size_t max_mem_bytes  = static_cast<size_t>(max_body_mem_mb) * 1024 * 1024;
@@ -324,7 +312,7 @@ int main() {
   drogon::app()
       .setTermSignalHandler([] { begin_graceful_shutdown("SIGTERM"); })
       .setIntSignalHandler([]  { begin_graceful_shutdown("SIGINT");  })
-      .addListener("0.0.0.0", port)
+      .addListener(cfg.host, port)
       .setThreadNum(io_threads)
       .setIdleConnectionTimeout(120)
       .setClientMaxBodySize(max_body_bytes)

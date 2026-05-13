@@ -21,6 +21,10 @@ models/
 # fastpdf2png binaries — auto-installed by scripts/install_fastpdf2png.sh
 bin/fastpdf2png
 bin/libpdfium.so
+
+# ONNX Runtime native install — fetched via CMake FetchContent for local
+# CPU builds (the Dockerfile downloads its own copy at image build time).
+third_party/onnxruntime/
 quantization/PaddleOCR/
 quantization/pretrained/
 quantization/output*/
