@@ -166,6 +166,7 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
     LayoutBox lb;
     lb.class_id = cls;
     lb.score = score;
+    lb.read_order = static_cast<int>(row[6]);
     lb.box[0] = {x0, y0};
     lb.box[1] = {x1, y0};
     lb.box[2] = {x1, y1};
@@ -191,6 +192,8 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
     return u > 0 ? inter / u : 0.0f;
   };
 
+  // Containment: if >=90% of box b's area is inside box a, b is contained.
+  constexpr float kContainmentFrac = 0.9f;
   auto is_contained = [](const LayoutBox &a, const LayoutBox &b) -> bool {
     int ax0 = a.box[0][0], ay0 = a.box[0][1], ax1 = a.box[2][0], ay1 = a.box[2][1];
     int bx0 = b.box[0][0], by0 = b.box[0][1], bx1 = b.box[2][0], by1 = b.box[2][1];
@@ -198,7 +201,7 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
     int ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
     float inter = std::max(0, ix1 - ix0) * std::max(0, iy1 - iy0);
     float area_b = (bx1 - bx0) * (by1 - by0);
-    return area_b > 0 && (inter / area_b) >= 0.8f;
+    return area_b > 0 && (inter / area_b) >= kContainmentFrac;
   };
 
   constexpr float kIoUSame = 0.6f, kIoUDiff = 0.98f;
@@ -219,15 +222,22 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
     }
   }
 
-  // Containment cleanup (both directions)
+  // Containment cleanup (both directions). Drop a box that is ≥90% inside
+  // another as a duplicate subset, UNLESS its class is one the model emits
+  // as a legitimate child of a larger region (see is_nestable_class) —
+  // those nested detections are intentional, not duplicates. Same-class
+  // containment was already handled by the NMS loop above. Mirrors the GPU
+  // path in paddle_layout.cpp.
   {
     std::vector<bool> drop(nms_out.size(), false);
     for (size_t i = 0; i < nms_out.size(); ++i) {
       if (drop[i]) continue;
       for (size_t j = i + 1; j < nms_out.size(); ++j) {
         if (drop[j]) continue;
-        if (is_contained(nms_out[j], nms_out[i])) { drop[i] = true; break; }
-        if (is_contained(nms_out[i], nms_out[j])) { drop[j] = true; }
+        if (is_contained(nms_out[j], nms_out[i]) &&
+            !is_nestable_class(nms_out[i].class_id)) { drop[i] = true; break; }
+        if (is_contained(nms_out[i], nms_out[j]) &&
+            !is_nestable_class(nms_out[j].class_id)) { drop[j] = true; }
       }
     }
     std::vector<LayoutBox> cleaned;
@@ -240,7 +250,7 @@ std::vector<LayoutBox> CpuPaddleLayout::run(const cv::Mat &img,
   // Filter large "image" detections
   const float img_area = static_cast<float>(orig_w) * orig_h;
   const float area_thresh = (orig_h > orig_w) ? 0.82f : 0.93f;
-  constexpr int kImageClassId = 14;
+  // kImageClassId lives in layout_types.h, pinned by static_assert.
   std::erase_if(nms_out, [&](const LayoutBox &lb) {
     if (lb.class_id != kImageClassId) return false;
     float box_area = static_cast<float>(lb.box[2][0] - lb.box[0][0]) *

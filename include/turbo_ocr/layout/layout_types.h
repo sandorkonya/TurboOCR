@@ -84,15 +84,53 @@ inline constexpr int reading_priority_bucket(int class_id) noexcept {
   }
 }
 
+// Class IDs referenced by the layout post-processor (NMS containment
+// cleanup + large-image filter in paddle_layout.cpp / cpu_paddle_layout.cpp).
+// Pinned to label-array slots by the static_asserts below so a PaddleX label
+// re-shuffle fails at build time rather than silently mis-classing boxes.
+inline constexpr int kImageClassId = 14; // "image"
+
+// Classes the layout model intentionally emits *nested* inside a larger
+// region — they are children, not duplicate subsets, so the post-NMS
+// containment cleanup must not drop them just because they sit inside a
+// parent box of another class. (Same-class containment is still handled by
+// the NMS loop itself.) Examples of the parent each one nests under:
+//   display_formula → content/text   figure_title   → image
+//   footnote        → footer          formula_number → display_formula
+//   inline_formula  → text            paragraph_title→ content
+//   text            → table/content
+inline constexpr bool is_nestable_class(int class_id) noexcept {
+  switch (class_id) {
+    case 5:  // display_formula
+    case 7:  // figure_title
+    case 10: // footnote
+    case 11: // formula_number
+    case 15: // inline_formula
+    case 17: // paragraph_title
+    case 22: // text
+      return true;
+    default:
+      return false;
+  }
+}
+
 // If PaddleX ever reshuffles the label list, fail at build time rather
-// than silently misrouting classes through reading_priority_bucket.
+// than silently misrouting classes through reading_priority_bucket,
+// is_nestable_class, or the large-image filter.
+static_assert(kLayoutLabels[5]  == "display_formula",  "class_id 5 must be 'display_formula'");
+static_assert(kLayoutLabels[7]  == "figure_title",      "class_id 7 must be 'figure_title'");
 static_assert(kLayoutLabels[8]  == "footer",            "class_id 8 must be 'footer'");
 static_assert(kLayoutLabels[9]  == "footer_image",      "class_id 9 must be 'footer_image'");
 static_assert(kLayoutLabels[10] == "footnote",          "class_id 10 must be 'footnote'");
+static_assert(kLayoutLabels[11] == "formula_number",    "class_id 11 must be 'formula_number'");
 static_assert(kLayoutLabels[12] == "header",            "class_id 12 must be 'header'");
 static_assert(kLayoutLabels[13] == "header_image",      "class_id 13 must be 'header_image'");
+static_assert(kLayoutLabels[14] == "image",             "class_id 14 must be 'image'");
+static_assert(kLayoutLabels[15] == "inline_formula",    "class_id 15 must be 'inline_formula'");
+static_assert(kLayoutLabels[17] == "paragraph_title",   "class_id 17 must be 'paragraph_title'");
 static_assert(kLayoutLabels[18] == "reference",         "class_id 18 must be 'reference'");
 static_assert(kLayoutLabels[19] == "reference_content", "class_id 19 must be 'reference_content'");
+static_assert(kLayoutLabels[22] == "text",              "class_id 22 must be 'text'");
 static_assert(kLayoutLabels[24] == "vision_footnote",   "class_id 24 must be 'vision_footnote'");
 
 // Reading direction for a layout cell or for the page as a whole.
@@ -114,6 +152,12 @@ struct LayoutBox {
   // Cross-reference ID emitted when layout detection is enabled. Default
   // -1 means "not assigned" and the serializer omits the field.
   int id = -1;
+  // Read-order index emitted by PP-DocLayoutV3 (column 6 of each detection
+  // row). Preserved straight from the model; -1 means "not provided". Note
+  // the OCR pipeline currently derives reading order geometrically via
+  // reading_order.cpp (class-bucketed XY-cut) and does NOT consume this
+  // field — it is kept so the model's native ordering signal isn't lost.
+  int read_order = -1;
 
   // Text-line metadata populated by cluster_text_lines (a per-cell pre-
   // pass that groups the OCR detection boxes whose layout_id maps to
