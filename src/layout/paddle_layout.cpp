@@ -208,6 +208,7 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     LayoutBox lb;
     lb.class_id = cls;
     lb.score = score;
+    lb.read_order = static_cast<int>(row[6]);
     lb.box[0] = {x0, y0};
     lb.box[1] = {x1, y0};
     lb.box[2] = {x1, y1};
@@ -240,7 +241,8 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     return union_area > 0 ? inter / union_area : 0.0f;
   };
 
-  // Containment: if >90% of box b's area is inside box a, b is contained.
+  // Containment: if >=90% of box b's area is inside box a, b is contained.
+  constexpr float kContainmentFrac = 0.9f;
   auto is_contained = [&](const LayoutBox &a, const LayoutBox &b) -> bool {
     auto [ax0, ay0, ax1, ay1] = box_coords(a);
     auto [bx0, by0, bx1, by1] = box_coords(b);
@@ -248,7 +250,7 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     int ix1 = std::min(ax1, bx1), iy1 = std::min(ay1, by1);
     float inter = std::max(0, ix1 - ix0) * std::max(0, iy1 - iy0);
     float area_b = (bx1 - bx0) * (by1 - by0);
-    return area_b > 0 && (inter / area_b) >= 0.8f;
+    return area_b > 0 && (inter / area_b) >= kContainmentFrac;
   };
 
   constexpr float kIoUSame = 0.6f;
@@ -271,19 +273,24 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
     }
   }
 
-  // Post-NMS containment cleanup: if box A is ≥90% inside box B (any class),
-  // drop A — it's a duplicate subset. Handles both same-class (e.g. nested
-  // tables) and cross-class (e.g. text lines inside a table region).
+  // Post-NMS containment cleanup: if a box is ≥90% inside another box, drop
+  // it as a duplicate subset — UNLESS its class is one the model emits as a
+  // legitimate child of a larger region (paragraph_title in content,
+  // figure_title in image, inline_formula in text, footnote in footer, …).
+  // Those are intentional nested detections, not duplicates, so they are
+  // preserved. Same-class containment was already handled by the NMS loop.
   {
     std::vector<bool> drop(nms_out.size(), false);
     for (size_t i = 0; i < nms_out.size(); ++i) {
       if (drop[i]) continue;
       for (size_t j = i + 1; j < nms_out.size(); ++j) {
         if (drop[j]) continue;
-        if (is_contained(nms_out[j], nms_out[i])) {
+        if (is_contained(nms_out[j], nms_out[i]) &&
+            !is_nestable_class(nms_out[i].class_id)) {
           drop[i] = true; break;
         }
-        if (is_contained(nms_out[i], nms_out[j])) {
+        if (is_contained(nms_out[i], nms_out[j]) &&
+            !is_nestable_class(nms_out[j].class_id)) {
           drop[j] = true;
         }
       }
@@ -298,7 +305,7 @@ std::vector<LayoutBox> PaddleLayout::collect(float score_threshold) {
   // Filter "image" detections that cover >82% (portrait) or >93% (landscape) of the page.
   const float img_area = static_cast<float>(orig_w) * orig_h;
   const float area_thresh = (orig_h > orig_w) ? 0.82f : 0.93f;
-  constexpr int kImageClassId = 14; // "image" in kLayoutLabels
+  // kImageClassId lives in layout_types.h, pinned by static_assert.
   std::erase_if(nms_out, [&](const LayoutBox &lb) {
     if (lb.class_id != kImageClassId) return false;
     float box_area = static_cast<float>(lb.box[2][0] - lb.box[0][0]) *
