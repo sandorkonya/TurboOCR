@@ -262,7 +262,8 @@ OcrPipelineResult OcrPipeline::run_with_layout(const cv::Mat &img,
     CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
     CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
     timer.gpu_start("layout_enqueue");
-    (void)layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_);
+    if (!layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_))
+      std::cerr << "[Pipeline] layout enqueue failed; layout omitted for this request\n";
     timer.gpu_stop();
   }
 
@@ -373,7 +374,8 @@ OcrPipelineResult OcrPipeline::run_layout_only(const cv::Mat &img,
   CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
 
   timer.gpu_start("layout_only");
-  (void)layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_);
+  if (!layout_->enqueue(gpu_img, img.rows, img.cols, layout_stream_))
+    std::cerr << "[Pipeline] layout enqueue failed; layout omitted for this request\n";
   out.layout = layout_->collect();
   timer.gpu_stop();
 
@@ -434,7 +436,8 @@ OcrPipelineResult OcrPipeline::run_with_layout(GpuImage gpu_img,
     CUDA_CHECK(cudaEventRecord(det_only_event_, stream));
     CUDA_CHECK(cudaStreamWaitEvent(layout_stream_, det_only_event_, 0));
     timer.gpu_start("layout_enqueue");
-    (void)layout_->enqueue(gpu_img, gpu_img.rows, gpu_img.cols, layout_stream_);
+    if (!layout_->enqueue(gpu_img, gpu_img.rows, gpu_img.cols, layout_stream_))
+      std::cerr << "[Pipeline] layout enqueue failed; layout omitted for this request\n";
     timer.gpu_stop();
   }
 
